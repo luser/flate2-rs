@@ -2,7 +2,6 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::marker;
-use std::mem;
 use std::slice;
 
 use libc::{c_int, c_uint};
@@ -13,12 +12,16 @@ use ffi;
 /// Raw in-memory compression stream for blocks of data.
 ///
 /// This type is the building block for the I/O streams in the rest of this
-/// crate. It requires more management than the `Read`/`Write` API but is
+/// crate. It requires more management than the [`Read`]/[`Write`] API but is
 /// maximally flexible in terms of accepting input from any source and being
 /// able to produce output to any memory location.
 ///
 /// It is recommended to use the I/O stream adaptors over this type as they're
 /// easier to use.
+///
+/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
+/// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
+#[derive(Debug)]
 pub struct Compress {
     inner: Stream<DirCompress>,
 }
@@ -26,18 +29,23 @@ pub struct Compress {
 /// Raw in-memory decompression stream for blocks of data.
 ///
 /// This type is the building block for the I/O streams in the rest of this
-/// crate. It requires more management than the `Read`/`Write` API but is
+/// crate. It requires more management than the [`Read`]/[`Write`] API but is
 /// maximally flexible in terms of accepting input from any source and being
 /// able to produce output to any memory location.
 ///
 /// It is recommended to use the I/O stream adaptors over this type as they're
 /// easier to use.
+///
+/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
+/// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
+#[derive(Debug)]
 pub struct Decompress {
     inner: Stream<DirDecompress>,
 }
 
+#[derive(Debug)]
 struct Stream<D: Direction> {
-    raw: ffi::mz_stream,
+    stream_wrapper: ffi::StreamWrapper,
     total_in: u64,
     total_out: u64,
     _marker: marker::PhantomData<D>,
@@ -50,11 +58,14 @@ trait Direction {
     unsafe fn destroy(stream: *mut ffi::mz_stream) -> c_int;
 }
 
+#[derive(Debug)]
 enum DirCompress {}
+#[derive(Debug)]
 enum DirDecompress {}
 
 /// Values which indicate the form of flushing to be used when compressing or
 /// decompressing in-memory data.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Flush {
     /// A typical parameter for passing to compression/decompression functions,
     /// this indicates that the underlying stream to decide how much data to
@@ -113,6 +124,7 @@ pub struct DataError(());
 
 /// Possible status results of compressing some data or successfully
 /// decompressing a block of data.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Status {
     /// Indicates success.
     ///
@@ -147,8 +159,8 @@ impl Compress {
     /// output data should have a zlib header or not.
     pub fn new(level: Compression, zlib_header: bool) -> Compress {
         unsafe {
-            let mut state: ffi::mz_stream = mem::zeroed();
-            let ret = ffi::mz_deflateInit2(&mut state,
+            let mut state = ffi::StreamWrapper::default();
+            let ret = ffi::mz_deflateInit2(&mut *state,
                                            level as c_int,
                                            ffi::MZ_DEFLATED,
                                            if zlib_header {
@@ -161,7 +173,7 @@ impl Compress {
             debug_assert_eq!(ret, 0);
             Compress {
                 inner: Stream {
-                    raw: state,
+                    stream_wrapper: state,
                     total_in: 0,
                     total_out: 0,
                     _marker: marker::PhantomData,
@@ -191,7 +203,7 @@ impl Compress {
     ///
     /// This is equivalent to dropping this object and then creating a new one.
     pub fn reset(&mut self) {
-        let rc = unsafe { ffi::mz_deflateReset(&mut self.inner.raw) };
+        let rc = unsafe { ffi::mz_deflateReset(&mut *self.inner.stream_wrapper) };
         assert_eq!(rc, ffi::MZ_OK);
 
         self.inner.total_in = 0;
@@ -210,18 +222,19 @@ impl Compress {
                     output: &mut [u8],
                     flush: Flush)
                     -> Status {
-        self.inner.raw.next_in = input.as_ptr() as *mut _;
-        self.inner.raw.avail_in = input.len() as c_uint;
-        self.inner.raw.next_out = output.as_mut_ptr();
-        self.inner.raw.avail_out = output.len() as c_uint;
+        let raw = &mut *self.inner.stream_wrapper;
+        raw.next_in = input.as_ptr() as *mut _;
+        raw.avail_in = input.len() as c_uint;
+        raw.next_out = output.as_mut_ptr();
+        raw.avail_out = output.len() as c_uint;
 
-        let rc = unsafe { ffi::mz_deflate(&mut self.inner.raw, flush as c_int) };
+        let rc = unsafe { ffi::mz_deflate(raw, flush as c_int) };
 
         // Unfortunately the total counters provided by zlib might be only
         // 32 bits wide and overflow while processing large amounts of data.
-        self.inner.total_in += (self.inner.raw.next_in as usize -
+        self.inner.total_in += (raw.next_in as usize -
                                 input.as_ptr() as usize) as u64;
-        self.inner.total_out += (self.inner.raw.next_out as usize -
+        self.inner.total_out += (raw.next_out as usize -
                                  output.as_ptr() as usize) as u64;
 
         match rc {
@@ -268,8 +281,8 @@ impl Decompress {
     /// to have a zlib header or not.
     pub fn new(zlib_header: bool) -> Decompress {
         unsafe {
-            let mut state: ffi::mz_stream = mem::zeroed();
-            let ret = ffi::mz_inflateInit2(&mut state,
+            let mut state = ffi::StreamWrapper::default();
+            let ret = ffi::mz_inflateInit2(&mut *state,
                                            if zlib_header {
                                                ffi::MZ_DEFAULT_WINDOW_BITS
                                            } else {
@@ -278,7 +291,7 @@ impl Decompress {
             debug_assert_eq!(ret, 0);
             Decompress {
                 inner: Stream {
-                    raw: state,
+                    stream_wrapper: state,
                     total_in: 0,
                     total_out: 0,
                     _marker: marker::PhantomData,
@@ -318,23 +331,30 @@ impl Decompress {
     ///
     /// To learn how much data was consumed or how much output was produced, use
     /// the `total_in` and `total_out` functions before/after this is called.
+    ///
+    /// # Errors
+    ///
+    /// If the input data to this instance of `Decompress` is not a valid
+    /// zlib/deflate stream then this function may return an instance of
+    /// `DataError` to indicate that the stream of input bytes is corrupted.
     pub fn decompress(&mut self,
                       input: &[u8],
                       output: &mut [u8],
                       flush: Flush)
                       -> Result<Status, DataError> {
-        self.inner.raw.next_in = input.as_ptr() as *mut u8;
-        self.inner.raw.avail_in = input.len() as c_uint;
-        self.inner.raw.next_out = output.as_mut_ptr();
-        self.inner.raw.avail_out = output.len() as c_uint;
+        let raw = &mut *self.inner.stream_wrapper;
+        raw.next_in = input.as_ptr() as *mut u8;
+        raw.avail_in = input.len() as c_uint;
+        raw.next_out = output.as_mut_ptr();
+        raw.avail_out = output.len() as c_uint;
 
-        let rc = unsafe { ffi::mz_inflate(&mut self.inner.raw, flush as c_int) };
+        let rc = unsafe { ffi::mz_inflate(raw, flush as c_int) };
 
         // Unfortunately the total counters provided by zlib might be only
         // 32 bits wide and overflow while processing large amounts of data.
-        self.inner.total_in += (self.inner.raw.next_in as usize -
+        self.inner.total_in += (raw.next_in as usize -
                                 input.as_ptr() as usize) as u64;
-        self.inner.total_out += (self.inner.raw.next_out as usize -
+        self.inner.total_out += (raw.next_out as usize -
                                  output.as_ptr() as usize) as u64;
 
         match rc {
@@ -355,6 +375,12 @@ impl Decompress {
     /// the vector provided or attempt to grow it, so space for the output must
     /// be reserved in the output vector by the caller before calling this
     /// function.
+    ///
+    /// # Errors
+    ///
+    /// If the input data to this instance of `Decompress` is not a valid
+    /// zlib/deflate stream then this function may return an instance of
+    /// `DataError` to indicate that the stream of input bytes is corrupted.
     pub fn decompress_vec(&mut self,
                           input: &[u8],
                           output: &mut Vec<u8>,
@@ -373,6 +399,37 @@ impl Decompress {
             output.set_len((self.total_out() - before) as usize + len);
             return ret
         }
+    }
+
+    /// Performs the equivalent of replacing this decompression state with a
+    /// freshly allocated copy.
+    ///
+    /// This function may not allocate memory, though, and attempts to reuse any
+    /// previously existing resources.
+    ///
+    /// The argument provided here indicates whether the reset state will
+    /// attempt to decode a zlib header first or not.
+    pub fn reset(&mut self, zlib_header: bool) {
+        self._reset(zlib_header);
+    }
+
+    #[cfg(feature = "zlib")]
+    fn _reset(&mut self, zlib_header: bool) {
+        let bits = if zlib_header {
+            ffi::MZ_DEFAULT_WINDOW_BITS
+        } else {
+            -ffi::MZ_DEFAULT_WINDOW_BITS
+        };
+        unsafe {
+            ffi::inflateReset2(&mut *self.inner.stream_wrapper, bits);
+        }
+        self.inner.total_out = 0;
+        self.inner.total_in = 0;
+    }
+
+    #[cfg(not(feature = "zlib"))]
+    fn _reset(&mut self, zlib_header: bool) {
+        *self = Decompress::new(zlib_header);
     }
 }
 
@@ -406,14 +463,17 @@ impl Direction for DirDecompress {
 impl<D: Direction> Drop for Stream<D> {
     fn drop(&mut self) {
         unsafe {
-            let _ = D::destroy(&mut self.raw);
+            let _ = D::destroy(&mut *self.stream_wrapper);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use {Decompress, Flush};
+    use std::io::Write;
+
+    use write;
+    use {Compression, Decompress, Flush};
 
     #[test]
     fn issue51() {
@@ -440,5 +500,27 @@ mod tests {
         // decompress data that has nothing to do with the deflate stream (this
         // used to panic)
         drop(d.decompress_vec(&[0], &mut decoded, Flush::None));
+    }
+
+    #[test]
+    fn reset() {
+        let string = "hello world".as_bytes();
+        let mut zlib = Vec::new();
+        let mut deflate = Vec::new();
+
+        let comp = Compression::Default;
+        write::ZlibEncoder::new(&mut zlib, comp).write_all(string).unwrap();
+        write::DeflateEncoder::new(&mut deflate, comp).write_all(string).unwrap();
+
+        let mut dst = [0; 1024];
+        let mut decoder = Decompress::new(true);
+        decoder.decompress(&zlib, &mut dst, Flush::Finish).unwrap();
+        assert_eq!(decoder.total_out(), string.len() as u64);
+        assert!(dst.starts_with(string));
+
+        decoder.reset(false);
+        decoder.decompress(&deflate, &mut dst, Flush::Finish).unwrap();
+        assert_eq!(decoder.total_out(), string.len() as u64);
+        assert!(dst.starts_with(string));
     }
 }
