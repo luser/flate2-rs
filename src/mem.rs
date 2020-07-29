@@ -184,7 +184,7 @@ impl Compress {
 
     /// Get the raw state of the underlying compressor.
     pub fn get_raw(&mut self) -> *mut ffi::mz_stream {
-        &mut self.inner.raw as *mut ffi::mz_stream
+        &mut *self.inner.stream_wrapper as *mut ffi::mz_stream
     }
 
     /// Returns the total number of input bytes which have been processed by
@@ -302,7 +302,7 @@ impl Decompress {
 
     /// Get the raw state of the underlying decompressor.
     pub fn get_raw(&mut self) -> *mut ffi::mz_stream {
-        &mut self.inner.raw as *mut ffi::mz_stream
+        &mut *self.inner.stream_wrapper as *mut ffi::mz_stream
     }
 
     /// Returns the total number of input bytes which have been processed by
